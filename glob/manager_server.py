@@ -92,6 +92,12 @@ async def get_risky_level(files, pip_packages):
     return "middle"
 
 
+def get_risky_level_sync(files, pip_packages):
+    # Synchronous version that runs in thread
+    loop = asyncio.new_event_loop()
+    return loop.run_until_complete(get_risky_level(files, pip_packages))
+
+
 class ManagerFuncsInComfyUI(core.ManagerFuncs):
     def get_current_preview_method(self):
         if args.preview_method == latent_preview.LatentPreviewMethod.Auto:
@@ -866,56 +872,65 @@ async def install_custom_node(request):
 
     json_data = await request.json()
 
-    # non-nightly cnr is safe
-    risky_level = None
-    cnr_id = json_data.get('id')
-    skip_post_install = json_data.get('skip_post_install')
+    # Run the installation in a thread pool
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        def do_install():
+            # non-nightly cnr is safe
+            risky_level = None
+            cnr_id = json_data.get('id')
+            skip_post_install = json_data.get('skip_post_install')
 
-    git_url = None
+            git_url = None
 
-    if json_data['version'] != 'unknown':
-        selected_version = json_data.get('selected_version', 'latest')
-        if selected_version != 'nightly':
-            risky_level = 'low'
-            node_spec_str = f"{cnr_id}@{selected_version}"
-        else:
-            node_spec_str = f"{cnr_id}@nightly"
-            git_url = [json_data.get('repository')]
-            if git_url is None:
-                logging.error(f"[ComfyUI-Manager] Following node pack doesn't provide `nightly` version: ${git_url}")
-                return web.Response(status=404, text=f"Following node pack doesn't provide `nightly` version: ${git_url}")
-    else:
-        # unknown
-        unknown_name = os.path.basename(json_data['files'][0])
-        node_spec_str = f"{unknown_name}@unknown"
-        git_url = json_data.get('files')
+            if json_data['version'] != 'unknown':
+                selected_version = json_data.get('selected_version', 'latest')
+                if selected_version != 'nightly':
+                    risky_level = 'low'
+                    node_spec_str = f"{cnr_id}@{selected_version}"
+                else:
+                    node_spec_str = f"{cnr_id}@nightly"
+                    git_url = [json_data.get('repository')]
+                    if git_url is None:
+                        logging.error(f"[ComfyUI-Manager] Following node pack doesn't provide `nightly` version: ${git_url}")
+                        return None, f"Following node pack doesn't provide `nightly` version: ${git_url}"
+            else:
+                # unknown
+                unknown_name = os.path.basename(json_data['files'][0])
+                node_spec_str = f"{unknown_name}@unknown"
+                git_url = json_data.get('files')
 
-    # apply security policy if not cnr node (nightly isn't regarded as cnr node)
-    if risky_level is None:
-        if git_url is not None:
-            risky_level = await get_risky_level(git_url, json_data.get('pip', []))
-        else:
-            return web.Response(status=404, text=f"Following node pack doesn't provide `nightly` version: ${git_url}")
+            # apply security policy if not cnr node (nightly isn't regarded as cnr node)
+            if risky_level is None:
+                if git_url is not None:
+                    risky_level = get_risky_level_sync(git_url, json_data.get('pip', []))
+                else:
+                    return None, f"Following node pack doesn't provide `nightly` version: ${git_url}"
 
-    if not is_allowed_security_level(risky_level):
-        logging.error(SECURITY_MESSAGE_GENERAL)
-        return web.Response(status=404, text="A security error has occurred. Please check the terminal logs")
+            if not is_allowed_security_level(risky_level):
+                logging.error(SECURITY_MESSAGE_GENERAL)
+                return None, "A security error has occurred. Please check the terminal logs"
 
-    node_spec = core.unified_manager.resolve_node_spec(node_spec_str)
+            node_spec = core.unified_manager.resolve_node_spec(node_spec_str)
+            if node_spec is None:
+                return None, f"Cannot resolve install target: '{node_spec_str}'"
 
-    if node_spec is None:
-        return web.Response(status=400, text=f"Cannot resolve install target: '{node_spec_str}'")
+            node_name, version_spec, is_specified = node_spec
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            res = loop.run_until_complete(core.unified_manager.install_by_id(
+                node_name, version_spec, json_data['channel'], json_data['mode'], 
+                return_postinstall=skip_post_install))
+            return res, None
 
-    node_name, version_spec, is_specified = node_spec
-    res = await core.unified_manager.install_by_id(node_name, version_spec, json_data['channel'], json_data['mode'], return_postinstall=skip_post_install)
-    # discard post install if skip_post_install mode
+        # Run in thread and get result
+        res, error = await asyncio.get_event_loop().run_in_executor(executor, do_install)
 
-    if res.action not in ['skip', 'enable', 'install-git', 'install-cnr', 'switch-cnr']:
-        logging.error(f"[ComfyUI-Manager] Installation failed:\n{res.msg}")
-        return web.Response(status=400, text=res.msg)
-    elif not res.result:
-        logging.error(f"[ComfyUI-Manager] Installation failed:\n{res.msg}")
-        return web.Response(status=400, text=res.msg)
+        if error:
+            return web.Response(status=400, text=error)
+        if res.action not in ['skip', 'enable', 'install-git', 'install-cnr', 'switch-cnr']:
+            return web.Response(status=400, text=res.msg)
+        if not res.result:
+            return web.Response(status=400, text=res.msg)
 
     return web.Response(status=200, text="Installation success.")
 
